@@ -30,6 +30,7 @@ class Scalar : public TsNode {
 
 torch::lazy::hash_t ScalarHash(const at::Scalar& s);
 
+// TODO: remove this after the aten version is exposed properly
 std::ostream& operator<<(std::ostream& ostrm, at::Scalar s);
 
 }  // namespace ops
