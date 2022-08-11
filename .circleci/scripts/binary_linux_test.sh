@@ -90,7 +90,7 @@ if [[ "$PACKAGE_TYPE" == conda ]]; then
       cu_ver="${DESIRED_CUDA:2:2}.${DESIRED_CUDA:4}"
       CUDA_PACKAGE="cudatoolkit"
       if [[ "$DESIRED_CUDA" == "cu116" || "$DESIRED_CUDA" == "cu117" ]]; then
-        CUDA_PACKAGE="cuda"
+        CUDA_PACKAGE=" pytorch-cuda"
       fi
 
       retry conda install \${EXTRA_CONDA_FLAGS} -yq -c nvidia -c pytorch "\${CUDA_PACKAGE}=\${cu_ver}"
