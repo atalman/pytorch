@@ -8,10 +8,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    paths:
-      - .github/workflows/generated-windows-binary-libtorch-debug-main.yml
-
   workflow_dispatch:
 
 env:
