@@ -51,7 +51,7 @@ jobs:
     needs: get-label-type
     with:
       build-environment: libtorch-linux-focal-cuda12.4-py3.10-gcc9
-      docker-image-name: pytorch-linux-focal-cuda12.4-cudnn9-py3-gcc9
+      docker-image-name: pytorch-linux-focal-cuda12.4-cudnn9-py3-gcc9:
       build-generates-artifacts: false
       runner_prefix: "${{ needs.get-label-type.outputs.label-type }}"
       runner: "linux.4xlarge"
