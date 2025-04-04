@@ -49,11 +49,12 @@ struct JittedVecKernelCache {
   at::cuda::jit::NvrtcFunction vec1;
   at::cuda::jit::NvrtcFunction vec2;
   at::cuda::jit::NvrtcFunction vec4;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   at::cuda::jit::NvrtcFunction vec8;
-#ifdef USE_ROCM
+#elif USE_ROCM
+  at::cuda::jit::NvrtcFunction vec8;
   at::cuda::jit::NvrtcFunction vec16;
 #endif
-
 };
 
 struct JittedKernelVariantCache {
@@ -72,15 +73,16 @@ inline c10::SmallBuffer<const void*, 64> pack_kernel_args(
   return ret;
 }
 
-template<typename array_t,
-         typename inp_calc_t,
-         typename out_calc_t,
-         typename loader_t,
-         typename storer_t>
+template <
+    typename array_t,
+    typename inp_calc_t,
+    typename out_calc_t,
+    typename loader_t,
+    typename storer_t>
 void launch_jitted_unrolled_kernel(
-    std::mutex &jiterator_mutex,
-    at::cuda::jit::NvrtcFunction &fn_cache,
-    const at::cuda::jit::KernelDescriptor &desc,
+    std::mutex& jiterator_mutex,
+    at::cuda::jit::NvrtcFunction& fn_cache,
+    const at::cuda::jit::KernelDescriptor& desc,
     int64_t N,
     array_t data,
     inp_calc_t ic,
@@ -91,48 +93,58 @@ void launch_jitted_unrolled_kernel(
     at::cuda::jit::BinaryFuncVariant scalar_pos,
     const void* scalar_val,
     c10::ArrayRef<const void*> extra_args) {
-
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
 
-  int tws = at::cuda::jit::calc_thread_work_size(desc.nInputs, desc.nOutputs, desc.f_inputs_type, desc.result_type);
+  int tws = at::cuda::jit::calc_thread_work_size(
+      desc.nInputs, desc.nOutputs, desc.f_inputs_type, desc.result_type);
   int bws = tws * num_threads();
-  //casting result to int is always safe, intermediate is int64 and won't overflow
+  // casting result to int is always safe, intermediate is int64 and won't
+  // overflow
   const uint32_t grid = (N + bws - 1) / bws;
 
   if (!fn_cache.function) {
     const std::lock_guard<std::mutex> lock{jiterator_mutex};
     if (!fn_cache.function) {
-      constexpr bool dynamic_casting = !std::is_same<decltype(l), memory::LoadWithoutCast>() ||
-                                       !std::is_same<decltype(s), memory::StoreWithoutCast>();
+      constexpr bool dynamic_casting =
+          !std::is_same<decltype(l), memory::LoadWithoutCast>() ||
+          !std::is_same<decltype(s), memory::StoreWithoutCast>();
       auto code = at::cuda::jit::generate_code(
           desc, contiguous, dynamic_casting, scalar_pos, tws);
       fn_cache = at::cuda::jit::jit_pwise_function(code, desc.name);
     }
   }
 
-  auto args = pack_kernel_args({&N, &data, &ic, &oc, &l, &s, scalar_val}, extra_args);
-  at::cuda::jit::launch_jitted_pwise_function(fn_cache, args.data(), {grid, 1u, 1u},
-  {num_threads(), 1u, 1u});
+  auto args =
+      pack_kernel_args({&N, &data, &ic, &oc, &l, &s, scalar_val}, extra_args);
+  at::cuda::jit::launch_jitted_pwise_function(
+      fn_cache, args.data(), {grid, 1u, 1u}, {num_threads(), 1u, 1u});
 }
 
-template<int arity, typename array_t>
+template <int arity, typename array_t>
 void launch_jitted_vectorized_kernel(
-    std::mutex &jiterator_mutex, JittedVecKernelCache &fn_cache,
-    const at::cuda::jit::KernelDescriptor &desc, int64_t N, array_t data,
+    std::mutex& jiterator_mutex,
+    JittedVecKernelCache& fn_cache,
+    const at::cuda::jit::KernelDescriptor& desc,
+    int64_t N,
+    array_t data,
     at::cuda::jit::BinaryFuncVariant scalar_pos,
-    const void *scalar_val, c10::ArrayRef<const void*> extra_args) {
+    const void* scalar_val,
+    c10::ArrayRef<const void*> extra_args) {
   TORCH_INTERNAL_ASSERT(N > 0 && N <= std::numeric_limits<int32_t>::max());
 
-  int tws = at::cuda::jit::calc_thread_work_size(desc.nInputs, desc.nOutputs, desc.f_inputs_type, desc.result_type);
+  int tws = at::cuda::jit::calc_thread_work_size(
+      desc.nInputs, desc.nOutputs, desc.f_inputs_type, desc.result_type);
   int bws = tws * num_threads();
-  // N is still int64_t for the computation, but it's always safe to cast result to int
+  // N is still int64_t for the computation, but it's always safe to cast result
+  // to int
   const uint32_t grid = (N + bws - 1) / bws;
 
   int vec_size = at::cuda::jit::can_vectorize_up_to(
       desc, c10::ArrayRef<char*>(data.data(), data.size()));
 
-#ifndef USE_ROCM
-  const auto input_size = c10::scalarTypeToTypeMeta(desc.f_inputs_type).itemsize();
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+  const auto input_size =
+      c10::scalarTypeToTypeMeta(desc.f_inputs_type).itemsize();
   const int optimal_vec_size = 16 / static_cast<int>(input_size);
   vec_size = std::min<int>(optimal_vec_size, vec_size);
   // Here we purposely omit vec8 for 1-byte data because of a bug in NVCC
@@ -143,22 +155,29 @@ void launch_jitted_vectorized_kernel(
   }
 #endif
 
-  // Different kernels are compiled depending on what we're vectorizing up to (1, 2 or 4 elements)
-  //   fn_ptr is set to the appropriate function based on the vec size and GPU used
+  // Different kernels are compiled depending on what we're vectorizing up to
+  // (1, 2 or 4 elements)
+  //   fn_ptr is set to the appropriate function based on the vec size and GPU
+  //   used
   at::cuda::jit::NvrtcFunction* fn_ptr = nullptr;
 
 #ifdef USE_ROCM
   if (vec_size == 16) {
     fn_ptr = &fn_cache.vec16;
+  } else if (vec_size == 8) {
+    fn_ptr = &fn_cache.vec8;
   } else
 #endif
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   if (vec_size == 8) {
     fn_ptr = &fn_cache.vec8;
-  } else if (vec_size == 4) {
+  } else
+#endif
+  if (vec_size == 4) {
     fn_ptr = &fn_cache.vec4;
   } else if (vec_size == 2) {
     fn_ptr = &fn_cache.vec2;
-  } else if (vec_size ==1) {
+  } else if (vec_size == 1) {
     fn_ptr = &fn_cache.vec1;
   } else {
     TORCH_INTERNAL_ASSERT(false, "unexpected vec_size for jitter vectorized kernel");
