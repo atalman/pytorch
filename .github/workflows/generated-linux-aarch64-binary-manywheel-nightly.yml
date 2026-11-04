@@ -56,12 +56,14 @@ jobs:
   #     Hub.
   #   - ciflow/binaries PR test: suffix = "-<hash>". Main publishes every
   #     .ci/docker tree it builds to Docker Hub under that tag, so a PR that
-  #     leaves .ci/docker untouched finds its image there and host = "". A PR
+  #     leaves .ci/docker untouched finds its images there and host = "". A PR
   #     that changes .ci/docker has a tree only its own ciflow/docker run has
   #     built, pushed to ECR by binary-docker-build, so host = the ECR host.
-  #     Because build-manywheel-images runs in parallel on the same PR, this
-  #     job then WAITS (polls ECR) until those images are pushed before the
-  #     build/test jobs start pulling them.
+  #     build-manywheel-images pushes each variant as its own job and may still
+  #     be running, so this job polls both registries until every image this
+  #     workflow pulls is in one of them (Docker Hub preferred). If neither gets the
+  #     full set in time it warns and uses the one with more of the images, so
+  #     only the legs missing an image fail.
   #   - otherwise (nightly branch, etc.): skipped; outputs read blank -> Docker
   #     Hub floating tag, unchanged.
   get-docker-tag:
@@ -77,7 +79,7 @@ jobs:
       contents: read
     outputs:
       docker_image_suffix: ${{ steps.calc.outputs.docker_image_suffix }}
-      docker_registry_host: ${{ steps.calc.outputs.docker_registry_host }}
+      docker_registry_host: ${{ steps.resolve.outputs.docker_registry_host || steps.calc.outputs.docker_registry_host }}
     steps:
       - name: Checkout PyTorch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -98,37 +100,26 @@ jobs:
           suffix=""
           registry_host=""
           if [[ "${GITHUB_REF}" == refs/tags/ciflow/binaries* ]]; then
-            # PR test run: content-addressed image, from Docker Hub if main has
-            # published this tree, else from ECR via the PR's ciflow/docker run.
+            # PR test run: content-addressed image.
             suffix="-$(git rev-parse HEAD:.ci/docker)"
-            registry_host="308535385114.dkr.ecr.us-east-1.amazonaws.com/"
-            # build-manywheel-images builds and pushes all variants together, so
-            # probe a single representative image. The tag API needs no login;
-            # any failure (404, outage) keeps the ECR path.
-            repo="pytorch/manylinux2_28_aarch64-builder"
-            tag="cpu-aarch64${suffix}"
-            if curl -fsS --retry 3 -o /dev/null "https://hub.docker.com/v2/repositories/${repo}/tags/${tag}"; then
-              echo "docker.io/${repo}:${tag} exists; using Docker Hub"
-              registry_host=""
-            else
-              echo "docker.io/${repo}:${tag} not on Docker Hub; using ECR"
-            fi
+            # The registry is resolved by the "Resolve builder image registry" step.
           elif [[ "${REF_TYPE}" == "tag" && "${REF_NAME}" == v* ]]; then
             # Release candidate: pin the Docker Hub image.
             suffix="-$(git rev-parse HEAD:.ci/docker)"
           fi
           echo "docker_image_suffix=${suffix}" >> "${GITHUB_OUTPUT}"
           echo "docker_registry_host=${registry_host}" >> "${GITHUB_OUTPUT}"
-      # ciflow/binaries with a tree Docker Hub lacks: the builder images are
-      # pushed to ECR by build-manywheel-images / build-almalinux-images, which
-      # run concurrently on the same PR. Log in (read-only) and wait for the
-      # content-addressed tags to appear before the build/test jobs try to pull
-      # them.
+      # ciflow/binaries: the builder images are on Docker Hub when main has built
+      # this .ci/docker tree, or in ECR when this PR's ciflow/docker run pushed them.
+      # Either may still be building, so log in to ECR (read-only; a failed login
+      # only means ECR is not considered) and poll both registries.
       - name: Login to ECR
-        if: ${{ startsWith(github.ref, 'refs/tags/ciflow/binaries') && steps.calc.outputs.docker_registry_host != '' }}
+        if: ${{ startsWith(github.ref, 'refs/tags/ciflow/binaries') }}
+        continue-on-error: true
         uses: pytorch/pytorch/.github/actions/ecr-login@main
-      - name: Wait for content-addressed builder image in ECR
-        if: ${{ startsWith(github.ref, 'refs/tags/ciflow/binaries') && steps.calc.outputs.docker_registry_host != '' }}
+      - name: Resolve builder image registry
+        id: resolve
+        if: ${{ startsWith(github.ref, 'refs/tags/ciflow/binaries') }}
         env:
           DOCKER_IMAGE_SUFFIX: ${{ steps.calc.outputs.docker_image_suffix }}
         shell: bash
@@ -136,26 +127,67 @@ jobs:
           set -euo pipefail
           # Drop the leading dash: "-<hash>" -> "<hash>".
           tree_hash="${DOCKER_IMAGE_SUFFIX#-}"
-          # build-manywheel-images builds and pushes all variants together, so
-          # wait on a single representative image as the readiness signal.
-          repo="pytorch/manylinux2_28_aarch64-builder"
-          tag="cpu-aarch64-${tree_hash}"
-          echo "Waiting for ${repo}:${tag} to be pushed to ECR by build-manywheel-images..."
-          # Poll every 5 min, up to 60 min.
-          deadline=$(( SECONDS + 60 * 60 ))
-          until aws ecr describe-images \
-              --region us-east-1 \
-              --repository-name "${repo}" \
-              --image-ids imageTag="${tag}" >/dev/null 2>&1; do
-            if (( SECONDS > deadline )); then
-              echo "ERROR: timed out (60 min) waiting for ${repo}:${tag} in ECR." >&2
-              echo "Is build-manywheel-images / build-almalinux-images still running or did it fail?" >&2
-              exit 1
+          images=(
+            "pytorch/manylinux2_28_aarch64-builder:cpu-aarch64-${tree_hash}"
+            "pytorch/manylinuxaarch64-builder:cuda13.2-${tree_hash}"
+            "pytorch/manylinuxaarch64-builder:cuda13.4-${tree_hash}"
+          )
+          # Poll every 5 min, up to 120 min in total. The images build in parallel;
+          # the slowest (CUDA, which builds NCCL from source) took up to ~60 min in
+          # build-manywheel-images recently, so 60 min left no margin.
+          deadline=$(( SECONDS + 120 * 60 ))
+          while true; do
+            missing_hub=()
+            for image in "${images[@]}"; do
+              # The tag API needs no login; any failure (404, outage) counts as missing.
+              if ! curl -fsS --retry 3 -o /dev/null "https://hub.docker.com/v2/repositories/${image%%:*}/tags/${image#*:}"; then
+                missing_hub+=("${image}")
+              fi
+            done
+            if [[ -z "${missing_hub[*]:-}" ]]; then
+              echo "Every builder image is on Docker Hub; using Docker Hub"
+              registry_host=""
+              break
             fi
-            echo "  not in ECR yet (build-manywheel-images still running); retrying in 5 min..."
+            missing_ecr=()
+            for image in "${images[@]}"; do
+              if ! aws ecr describe-images --region us-east-1 \
+                  --repository-name "${image%%:*}" \
+                  --image-ids imageTag="${image#*:}" >/dev/null 2>&1; then
+                missing_ecr+=("${image}")
+              fi
+            done
+            if [[ -z "${missing_ecr[*]:-}" ]]; then
+              echo "Every builder image is in ECR; using ECR"
+              registry_host="308535385114.dkr.ecr.us-east-1.amazonaws.com/"
+              break
+            fi
+            if (( SECONDS > deadline )); then
+              # Keep going with the registry that has more of the images, so only the
+              # legs whose image is missing fail (at "Initialize containers"), as
+              # before, instead of every job in the workflow.
+              echo "WARNING: after 120 min neither registry has every builder image for .ci/docker tree ${tree_hash}." >&2
+              echo "Missing on Docker Hub: ${missing_hub[*]}" >&2
+              echo "Missing in ECR: ${missing_ecr[*]}" >&2
+              echo "If this PR changes .ci/docker, add the ciflow/docker label so its images are pushed to ECR." >&2
+              echo "Otherwise a build-manywheel-images run on main for this tree may still be running or have failed." >&2
+              hub_missing_count=0
+              for _ in "${missing_hub[@]}"; do hub_missing_count=$(( hub_missing_count + 1 )); done
+              ecr_missing_count=0
+              for _ in "${missing_ecr[@]}"; do ecr_missing_count=$(( ecr_missing_count + 1 )); done
+              if (( hub_missing_count <= ecr_missing_count )); then
+                registry_host=""
+              else
+                registry_host="308535385114.dkr.ecr.us-east-1.amazonaws.com/"
+              fi
+              break
+            fi
+            echo "Not every builder image is in one registry yet; retrying in 5 min..."
+            echo "  missing on Docker Hub: ${missing_hub[*]}"
+            echo "  missing in ECR: ${missing_ecr[*]}"
             sleep 300
           done
-          echo "Found ${repo}:${tag}"
+          echo "docker_registry_host=${registry_host}" >> "${GITHUB_OUTPUT}"
 
   manywheel-cpu-aarch64-build:
     name: manywheel-cpu-aarch64-build
